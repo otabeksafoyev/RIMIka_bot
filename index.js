@@ -6,7 +6,7 @@ const { v4: uuidv4 } = require('uuid');
 // ======================
 // SOZLAMALAR
 // ======================
-const TOKEN = "8234533176:AAGBFnxUN1BnJRLsupQJvq52LpEtFBCR7OI";
+const TOKEN = "8259775501:AAE8xgn5b1ryPnZ7MFXNMFQE_GmUQlEtRGU";
 const MONGO_URL = "mongodb+srv://safootabekyev_db_user:kKjW0vqmvhPbPzk6@cluster0.pniaa23.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0";
 const UPLOAD_CHANNEL = "Sakuramibacent";
 const SUB_CHANNEL = "SakuramiTG";
