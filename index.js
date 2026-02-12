@@ -128,18 +128,18 @@ function get_required_channels() {
 
 async function get_subscription_statuses(user_id) { 
     const channels = await get_user_required_channels(user_id);
-    const statuses = [];
-
-    for (let ch of channels) {
+    const promises = channels.map(async (ch) => {
         try {
             const member = await bot.getChatMember(`@${ch}`, user_id);
-            const subscribed = ['member', 'creator', 'administrator'].includes(member.status);
-            statuses.push({ channel: ch, subscribed });
+            return {
+                channel: ch,
+                subscribed: ['member', 'creator', 'administrator'].includes(member.status)
+            };
         } catch {
-            statuses.push({ channel: ch, subscribed: false });
+            return { channel: ch, subscribed: false };
         }
-    }
-    return statuses;
+    });
+    return Promise.all(promises);
 }
 
 async function is_subscribed(user_id) {
@@ -162,18 +162,26 @@ async function check_subscription_and_proceed(chat_id, serial_id, part = 1) {
     const unsubscribed = statuses.filter(s => !s.subscribed);
 
     if (unsubscribed.length > 0) {
+        let messageText = "❌ Anime tomosha qilish uchun quyidagi kanallarga obuna bo‘ling:\n\n";
         const markup = { inline_keyboard: [] };
 
-        for (let status of statuses) {
-            const text = status.subscribed 
-                ? `✅ Obuna bo'ldingiz` 
-                : `Obuna bo'lish`;
-            markup.inline_keyboard.push([{ text: text, url: `https://t.me/${status.channel}` }]);
+        statuses.forEach(status => {
+            if (status.subscribed) {
+                messageText += `✅ @${status.channel} — obuna bo‘lgansiz\n`;
+            } else {
+                messageText += `📢 @${status.channel} — obuna bo‘ling!\n`;
+                markup.inline_keyboard.push([{
+                    text: `Obuna bo'lish → @${status.channel}`,
+                    url: `https://t.me/${status.channel}`
+                }]);
+            }
+        });
+
+        if (markup.inline_keyboard.length > 0) {
+            markup.inline_keyboard.push([{ text: "✅ Tekshirib ko'rdim", callback_data: `check_sub_play_${serial_id}_${part}` }]);
         }
 
-        markup.inline_keyboard.push([{ text: "✅ Tekshirish", callback_data: `check_sub_play_${serial_id}_${part}` }]);
-
-        bot.sendMessage(chat_id, "❌ Anime tomosha qilish uchun quyidagi kanallarga obuna bo‘ling:", { reply_markup: markup });
+        bot.sendMessage(chat_id, messageText, { reply_markup: markup });
         return;
     }
 
@@ -296,7 +304,7 @@ bot.on('message', async (msg) => {
 
     const anime = await findAnime(id);
     if (!anime) {
-        return bot.sendMessage(msg.chat.id, "❌ Bunday anime kodi topilmadi.");
+        return bot.sendMessage(msg.chat.id, "❌ Anime topilmadi. Iltimos, kodni tekshirib qayta kiriting yoki tomosha qilish tugmasini bosing");
     }
 
     if (await episodes.findOne({ serial_id: anime._id, part })) {
@@ -999,32 +1007,6 @@ async function save_trailer(msg, data) {
     bot.sendMessage(msg.chat.id, `✅ Anime qo‘shildi!\n\nInternal ID: ${internal_id}\nCustom ID: ${data.custom_id}`);
 }
 
-async function send_anime_card(chat_id, serial_id) {
-    const anime = await serials.findOne({ _id: serial_id });
-    if (!anime) return;
-
-    const markup = {
-        inline_keyboard: [[{ text: "🧧 Ko‘rish", url: `https://t.me/${BOT_USERNAME}?start=${anime.custom_id || anime._id}` }]]
-    };
-
-    const caption = `
-🎌 <b>Yangi Anime Qo‘shildi!</b> 🎌
-
-🎬 <b>Nomi:</b> ${anime.title}
-📦 <b>Qismlar soni:</b> ${anime.total}
-🎭 <b>Janr:</b> ${anime.genres}
-🆔 <b>Anime kodi:</b> <code>${anime.custom_id}</code>
-
-❤️ Rimika Uz bilan birga tomosha qiling!
-    `.trim();
-
-    await bot.sendVideo(chat_id, anime.trailer, {
-        caption,
-        reply_markup: markup,
-        parse_mode: "HTML"
-    });
-}
-
 // ======================
 // Kanalga qism yuklash
 // ======================
@@ -1123,6 +1105,53 @@ bot.onText(/\/list_region_channels/, async (msg) => {
     } 
     bot.sendMessage(msg.chat.id, text, { parse_mode: "HTML" }); 
 }); 
+
+// Change ID
+bot.onText(/\/changeid\s+(.+)/, async (msg, match) => {
+    if (!is_admin(msg.from.id)) return bot.sendMessage(msg.chat.id, "Bu buyruq faqat adminlar uchun.");
+    
+    const oldId = match[1].trim();
+    const anime = await serials.findOne({ $or: [{ _id: oldId }, { custom_id: oldId }] });
+    if (!anime) return bot.sendMessage(msg.chat.id, `ID ${oldId} bilan anime topilmadi`);
+
+    bot.sendMessage(msg.chat.id, `Anime ID sini o'zgartirmoqchisiz:\nEski ID: ${oldId}\nNomi: ${anime.title}\n\nYangi ID ni yozing:`);
+    bot.once('message', async (res) => {
+        const text = res.text?.trim();
+        if (!text) {
+            return bot.sendMessage(res.chat.id, "❗ ID yozing");
+        }
+
+        const newId = text;
+
+        if (await serials.findOne({ $or: [{ _id: newId }, { custom_id: newId }] })) {
+            return bot.sendMessage(res.chat.id, `❌ ID ${newId} band. Boshqasini tanlang.`);
+        }
+
+        try {
+            const animeDoc = await serials.findOne({ _id: anime._id });
+            if (!animeDoc) throw new Error("Eski anime topilmadi");
+
+            await serials.deleteOne({ _id: anime._id });
+            await serials.insertOne({ ...animeDoc, _id: newId });
+
+            const partsResult = await episodes.updateMany(
+                { serial_id: anime._id },
+                { $set: { serial_id: newId } }
+            );
+
+            await bot.sendMessage(
+                res.chat.id,
+                `✅ ID muvaffaqiyatli o‘zgartirildi!\n\n` +
+                `Eski ID: ${oldId}\n` +
+                `Yangi ID: ${newId}\n` +
+                `Qismlar yangilandi: ${partsResult.modifiedCount}`
+            );
+        } catch (err) {
+            console.error("changeid xatosi:", err);
+            await bot.sendMessage(res.chat.id, "❌ Xatolik yuz berdi");
+        }
+    });
+});
 
 // Botni ishga tushiramiz 
 startBot(); 
