@@ -10,6 +10,7 @@
   "license": "ISC",
   "dependencies": {
     "axios": "^1.13.2",
+    "dotenv": "^17.3.1",
     "express": "^5.2.1",
     "form-data": "^4.0.5",
     "mongodb": "^7.0.0",
@@ -17,5 +18,13 @@
     "telegraf": "^4.16.3",
     "uuid": "^13.0.0"
   },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/otabeksafoyev/RIMIka_bot.git"
+  },
+  "bugs": {
+    "url": "https://github.com/otabeksafoyev/RIMIka_bot/issues"
+  },
+  "homepage": "https://github.com/otabeksafoyev/RIMIka_bot#readme",
   "description": ""
 }
