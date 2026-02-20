@@ -30,6 +30,7 @@ let episodes;
 let users;
 let settings;
 let banned_users;
+let partners;  // New collection for partners
 
 // ======================
 const REGIONS = [
@@ -51,6 +52,7 @@ async function connectToMongo() {
     users = db.collection("users");
     settings = db.collection("settings");
     banned_users = db.collection("banned_users");
+    partners = db.collection("partners");  // New
   } catch (err) {
     console.error("❌ MongoDB ulanishda xato:", err.message);
     process.exit(1);
@@ -90,10 +92,14 @@ async function startBot() {
 }
 
 // ======================
-// Admin va obuna tekshiruvi
+// Admin va hamkor tekshiruvi
 // ======================
 function is_admin(uid) {
   return ADMIN_IDS.includes(uid);
+}
+
+async function is_partner(uid) {
+  return await partners.findOne({ user_id: uid }) !== null;
 }
 
 let required_channels = [SUB_CHANNEL];
@@ -102,7 +108,7 @@ async function update_required_channels() {
   required_channels = [SUB_CHANNEL].concat(doc?.channels || []);
 }
 
-async function get_user_required_channels(user_id) {
+async function get_user_required_channels(user_id, anime = null) {
   let base = required_channels;
   const user = await users.findOne({ user_id });
   if (user && user.region) {
@@ -111,11 +117,17 @@ async function get_user_required_channels(user_id) {
       base = base.concat(doc.channels[user.region]);
     }
   }
+  // If anime has added_by (partner), add partner's channel
+  if (anime && anime.added_by) {
+    const partner = await partners.findOne({ user_id: anime.added_by });
+    if (partner && partner.partner_channel) {
+      base.push(partner.partner_channel);
+    }
+  }
   return [...new Set(base)];
 }
 
-async function get_subscription_statuses(user_id) {
-  const channels = await get_user_required_channels(user_id);
+async function get_subscription_statuses(user_id, channels) {
   const promises = channels.map(async (ch) => {
     try {
       const member = await bot.getChatMember(`@${ch}`, user_id);
@@ -130,8 +142,8 @@ async function get_subscription_statuses(user_id) {
   return Promise.all(promises);
 }
 
-async function is_subscribed(user_id) {
-  const statuses = await get_subscription_statuses(user_id);
+async function is_subscribed(user_id, channels) {
+  const statuses = await get_subscription_statuses(user_id, channels);
   return statuses.every(s => s.subscribed);
 }
 
@@ -145,15 +157,10 @@ async function check_subscription_and_proceed(chat_id, serial_id, part = 1) {
     bot.sendMessage(chat_id, `🚫 Siz botdan bloklangansiz. Admin: @${ADMIN_USERNAME}`);
     return;
   }
-
-  // Adminlar obuna tekshiruvidan o'tkazib yuboriladi
-  if (is_admin(user_id)) {
-    return send_episode(chat_id, serial_id, part);
-  }
-
-  const statuses = await get_subscription_statuses(user_id);
+  const anime = await serials.findOne({ _id: serial_id });
+  const channels = await get_user_required_channels(user_id, anime);
+  const statuses = await get_subscription_statuses(user_id, channels);
   const unsubscribed = statuses.filter(s => !s.subscribed);
-
   if (unsubscribed.length > 0) {
     let messageText = "❌ Anime tomosha qilish uchun quyidagi kanallarga obuna bo‘ling:\n\n";
     const markup = { inline_keyboard: [] };
@@ -174,7 +181,6 @@ async function check_subscription_and_proceed(chat_id, serial_id, part = 1) {
     bot.sendMessage(chat_id, messageText, { reply_markup: markup });
     return;
   }
-
   send_episode(chat_id, serial_id, part);
 }
 
@@ -185,7 +191,6 @@ async function send_start_banner(chat_id) {
   const total_users = await users.countDocuments({});
   const top_anime = await serials.findOne({}, { sort: { views: -1 } }) || { title: "Hali anime yo‘q", views: 0 };
   const banner_url = "https://i.postimg.cc/yYXCsTkw/photo-2026-01-05-15-32-43.jpg";
-
   const caption = (
     ". . ── •✧⛩✧• ── . .\n" +
     "• ❤️ Rimika Uz bilan hammasi yanada ossonroq o((≧ω≦ ))o\n" +
@@ -196,7 +201,6 @@ async function send_start_banner(chat_id) {
     `👨‍💻 Dasturchi: @${ADMIN_USERNAME}\n` +
     ". . ── •✧⛩✧• ── . ."
   );
-
   const markup = {
     inline_keyboard: [
       [{ text: "🔍 Anime qidirish", switch_inline_query_current_chat: "" }],
@@ -205,13 +209,11 @@ async function send_start_banner(chat_id) {
       [{ text: "👑 Hamkor Bo‘lish", callback_data: "become_partner" }]
     ]
   };
-
   try {
     await bot.sendPhoto(chat_id, banner_url, { caption, reply_markup: markup, parse_mode: "HTML" });
   } catch {
     await bot.sendMessage(chat_id, caption, { reply_markup: markup, parse_mode: "HTML" });
   }
-
   const enabledDoc = await settings.findOne({ key: "region_survey_enabled" });
   const enabled = enabledDoc ? enabledDoc.value : false;
   if (enabled) {
@@ -245,12 +247,11 @@ async function send_region_survey(chat_id) {
 }
 
 // ======================
-// Message handler (anime ID yozilganda)
+// Shunchaki ID yozilsa anime chiqarish (ENG ASOSIY QISM)
 // ======================
 bot.on('message', async (msg) => {
   if (!msg.text) return;
   let payload = msg.text.trim();
-
   if (payload.startsWith('/')) {
     if (payload.startsWith('/start ')) {
       payload = payload.replace('/start ', '').trim();
@@ -258,9 +259,7 @@ bot.on('message', async (msg) => {
       return;
     }
   }
-
   if (payload.length < 1) return;
-
   let id = payload;
   let part = 1;
   if (payload.includes('_')) {
@@ -268,12 +267,10 @@ bot.on('message', async (msg) => {
     id = parts[0].trim();
     part = parseInt(parts[1]) || 1;
   }
-
   const anime = await findAnime(id);
   if (!anime) {
     return bot.sendMessage(msg.chat.id, "❌ Anime topilmadi. Iltimos, kodni tekshirib qayta kiriting yoki tomosha qilish tugmasini bosing");
   }
-
   if (await episodes.findOne({ serial_id: anime._id, part })) {
     await check_subscription_and_proceed(msg.chat.id, anime._id, part);
   } else if (await episodes.findOne({ serial_id: anime._id, part: 1 })) {
@@ -283,6 +280,9 @@ bot.on('message', async (msg) => {
   }
 });
 
+// ======================
+// /start (faqat banner chiqarish uchun, parametr siz)
+// ======================
 bot.onText(/\/start$/, async (msg) => {
   await send_start_banner(msg.chat.id);
 });
@@ -313,35 +313,6 @@ bot.on('web_app_data', async (msg) => {
 bot.on('callback_query', async (query) => {
   bot.answerCallbackQuery(query.id);
   const chat_id = query.message.chat.id;
-
-  if (query.data === "become_partner") {
-    const partnerText = 
-`👑 **Hamkor Bo‘lish**
-
-O‘z anime kanalingizni o‘stirib, obunachi yig‘ishni xohlaysizmi?
-
-Biz bilan hamkorlik orqali siz:
-✔️ Anime qo‘shasiz va o‘z kanalingizga obunachi yig‘asiz
-✔️ Kanal orqali daromad qilish imkoniga ega bo‘lasiz
-✔️ Alohida bot sotib olishingiz shart emas
-✔️ Hamkorlik bepul — boshlash uchun to‘lov yo‘q
-✔️ Anime qo‘shish va kanallarni ulash to‘liq o‘rgatiladi
-
-Savollaringiz bo‘lsa, admin bilan bevosita bog‘lanishingiz mumkin.
-
-Hamkorlikni boshlash uchun pastdagi tugmani bosing 👇`;
-
-    const markup = {
-      inline_keyboard: [
-        [{ text: "🔘 Adminga yozish", url: ADMIN_CHAT_LINK }],
-        [{ text: "🏠 Bosh menyuga", callback_data: "back_to_start" }]
-      ]
-    };
-
-    bot.sendMessage(chat_id, partnerText, { parse_mode: "Markdown", reply_markup: markup });
-    return;
-  }
-
   if (query.data.startsWith("set_region_")) {
     const region = query.data.replace("set_region_", "");
     if (REGIONS.includes(region)) {
@@ -351,7 +322,6 @@ Hamkorlikni boshlash uchun pastdagi tugmani bosing 👇`;
     }
     return;
   }
-
   if (query.data === "genres_list") {
     const markup = {
       inline_keyboard: [
@@ -364,10 +334,7 @@ Hamkorlikni boshlash uchun pastdagi tugmani bosing 👇`;
       ]
     };
     bot.sendMessage(chat_id, "🎭 <b>Janrni tanlang:</b>\n\nTanlaganingizdan keyin shu janrdagi animelar ro‘yxati chiqadi!", { parse_mode: "HTML", reply_markup: markup });
-    return;
-  }
-
-  if (query.data.startsWith("genre_")) {
+  } else if (query.data.startsWith("genre_")) {
     const genre = query.data.replace("genre_", "");
     const anime_list = await serials.find({ genres: { $regex: genre, $options: "i" } }).limit(20).toArray();
     if (anime_list.length === 0) {
@@ -394,22 +361,13 @@ Hamkorlikni boshlash uchun pastdagi tugmani bosing 👇`;
       { text: "🏠 Bosh menyuga", callback_data: "back_to_start" }
     ]);
     bot.sendMessage(chat_id, text, { parse_mode: "HTML", reply_markup: markup });
-    return;
-  }
-
-  if (query.data === "back_to_start") {
+  } else if (query.data === "back_to_start") {
     await send_start_banner(chat_id);
-    return;
-  }
-
-  if (query.data === "news") {
+  } else if (query.data === "news") {
     bot.sendMessage(chat_id, `📢 Yangiliklar uchun kanalimiz: @${NEWS_CHANNEL}`, {
       reply_markup: { inline_keyboard: [[{ text: "📢 Kanalga o'tish", url: `https://t.me/${NEWS_CHANNEL}` }]] }
     });
-    return;
-  }
-
-  if (query.data === "how_it_works") {
+  } else if (query.data === "how_it_works") {
     const text = (
       "🧠 <b>Bot qanday ishlaydi?</b>\n\n" +
       "1. Oddiy xabarga anime kodini yozing (masalan: naruto, 85)\n" +
@@ -419,21 +377,39 @@ Hamkorlikni boshlash uchun pastdagi tugmani bosing 👇`;
       "Rahmat foydalanganingiz uchun! ❤️"
     );
     bot.sendMessage(chat_id, text, { parse_mode: "HTML" });
-    return;
-  }
+  } else if (query.data === "become_partner") {
+    const partnerText = 
+`👑 **Hamkor Bo‘lish**
 
-  if (query.data.startsWith("check_sub_play_")) {
+O‘z anime kanalingizni o‘stirib, obunachi yig‘ishni xohlaysizmi?
+
+Biz bilan hamkorlik orqali siz:
+✔️ Anime qo‘shasiz va o‘z kanalingizga obunachi yig‘asiz
+✔️ Kanal orqali daromad qilish imkoniga ega bo‘lasiz
+✔️ Alohida bot sotib olishingiz shart emas
+✔️ Hamkorlik bepul — boshlash uchun to‘lov yo‘q
+✔️ Anime qo‘shish va kanallarni ulash to‘liq o‘rgatiladi
+
+Savollaringiz bo‘lsa, admin bilan bevosita bog‘lanishingiz mumkin.
+
+Hamkorlikni boshlash uchun pastdagi tugmani bosing 👇`;
+
+    const markup = {
+      inline_keyboard: [
+        [{ text: "🔘 Adminga yozish", url: ADMIN_CHAT_LINK }],
+        [{ text: "🏠 Bosh menyuga", callback_data: "back_to_start" }]
+      ]
+    };
+
+    bot.sendMessage(chat_id, partnerText, { parse_mode: "Markdown", reply_markup: markup });
+  } else if (query.data.startsWith("check_sub_play_")) {
     const parts = query.data.split("_");
     const serial_id = parts[3];
     const part = parseInt(parts[4]);
     await check_subscription_and_proceed(chat_id, serial_id, part);
-    return;
-  }
-
-  if (query.data.startsWith("play_")) {
+  } else if (query.data.startsWith("play_")) {
     const [, serial_id, part] = query.data.split("_");
     await check_subscription_and_proceed(chat_id, serial_id, parseInt(part));
-    return;
   }
 });
 
@@ -481,7 +457,6 @@ async function send_episode(chat_id, serial_id, part = 1) {
     return;
   }
   await serials.updateOne({ _id: serial_id }, { $inc: { views: 1 } });
-
   const markup = { inline_keyboard: [] };
   const total_parts = anime.total;
   const PAGE_SIZE = 50;
@@ -520,10 +495,8 @@ async function send_episode(chat_id, serial_id, part = 1) {
 }
 
 // ======================
-// ADMIN BUYRUQLARI
+// ADMIN BUYRUQLARI (HAMMASI)
 // ======================
-
-// Treylerni qayta yuborish
 bot.onText(/\/resendtrailer(?:\s+(.+))?/, async (msg, match) => {
   if (!is_admin(msg.from.id)) return;
   const sid = match[1]?.trim();
@@ -531,7 +504,9 @@ bot.onText(/\/resendtrailer(?:\s+(.+))?/, async (msg, match) => {
   let anime = await findAnime(sid);
   if (!anime) return bot.sendMessage(msg.chat.id, "❌ Anime topilmadi");
   await send_anime_card(msg.chat.id, anime._id);
-  try { await send_anime_card(`@${SUB_CHANNEL}`, anime._id); } catch {}
+  try {
+    await send_anime_card(`@${SUB_CHANNEL}`, anime._id);
+  } catch {}
   bot.sendMessage(msg.chat.id, `✅ ${anime.title} treyleri yuborildi`);
 });
 
@@ -548,8 +523,12 @@ async function send_anime_card(chat_id, serial_id) {
 🎭 <b>Janr:</b> ${anime.genres}
 🆔 <b>Anime kodi:</b> <code>${anime.custom_id}</code>
 ❤️ Rimika Uz bilan birga tomosha qiling!
-  `.trim();
-  await bot.sendVideo(chat_id, anime.trailer, { caption, reply_markup: markup, parse_mode: "HTML" });
+    `.trim();
+  await bot.sendVideo(chat_id, anime.trailer, {
+    caption,
+    reply_markup: markup,
+    parse_mode: "HTML"
+  });
 }
 
 // Treylerni o'zgartirish
@@ -675,6 +654,13 @@ bot.onText(/\/stats/, async (msg) => {
   top5.forEach((a, i) => {
     text += `${i + 1}. ${a.title} — ${a.views || 0} ko‘rish\n`;
   });
+  const regionCounts = await users.aggregate([{ $group: { _id: "$region", count: { $sum: 1 } } }]).toArray();
+  const unanswered = await users.countDocuments({ region: { $exists: false } });
+  text += "\n<b>Viloyatlar bo'yicha:</b>\n";
+  regionCounts.forEach(rc => {
+    text += `${rc._id || "Noma'lum"}: ${rc.count}\n`;
+  });
+  text += `Javob bermagan: ${unanswered}\n`;
   bot.sendMessage(msg.chat.id, text, { parse_mode: "HTML" });
 });
 
@@ -743,9 +729,9 @@ async function edit_genres(msg, ctx) {
   bot.sendMessage(ctx.chatId, "✅ Yangilandi!");
 }
 
-// Qism yuklash (admin video yuborsa va caption /uploadpart bo‘lsa)
+// Qism yuklash (admin va hamkor video yuborsa va caption /uploadpart bo‘lsa)
 bot.on('video', async (msg) => {
-  if (is_admin(msg.from.id) && msg.caption && msg.caption.trim().toLowerCase() === "/uploadpart") {
+  if ((await is_partner(msg.from.id) || is_admin(msg.from.id)) && msg.caption && msg.caption.trim().toLowerCase() === "/uploadpart") {
     bot.replyToMessage(msg.chat.id, msg.message_id, "Video qabul qilindi! Anime ID yuboring:").then(() => {
       bot.once('message', (res) => upload_part_id(res, msg.video.file_id));
     });
@@ -888,16 +874,17 @@ async function remove_channel(msg) {
   bot.sendMessage(msg.chat.id, result.modifiedCount ? "✅ O‘chirildi" : "❌ Topilmadi");
 }
 
-// Anime qo'shish
-bot.onText(/\/addanime/, (msg) => {
-  if (!is_admin(msg.from.id)) return;
+// Anime qo'shish (admin va hamkor uchun)
+bot.onText(/\/addanime/, async (msg) => {
+  const uid = msg.from.id;
+  if (!is_admin(uid) && !(await is_partner(uid))) return;
   bot.sendMessage(msg.chat.id, "Anime nomini yozing:").then(() => {
-    bot.once('message', (res) => step_title(res));
+    bot.once('message', (res) => step_title(res, uid));
   });
 });
 
-async function step_title(msg) {
-  const data = { title: msg.text };
+async function step_title(msg, added_by) {
+  const data = { title: msg.text, added_by };
   bot.sendMessage(msg.chat.id, "Nechta qismi bor?").then(() => {
     bot.once('message', (res) => step_total(res, data));
   });
@@ -934,7 +921,7 @@ async function save_trailer(msg, data) {
     return;
   }
   const internal_id = uuidv4();
-  await serials.insertOne({
+  const animeDoc = {
     _id: internal_id,
     custom_id: data.custom_id,
     title: data.title,
@@ -943,7 +930,14 @@ async function save_trailer(msg, data) {
     trailer: msg.video.file_id,
     poster_file_id: null,
     views: 0
-  });
+  };
+  if (await is_partner(data.added_by)) {
+    animeDoc.added_by = data.added_by;
+  }
+  await serials.insertOne(animeDoc);
+  if (await is_partner(data.added_by)) {
+    await partners.updateOne({ user_id: data.added_by }, { $push: { added_animes: internal_id } });
+  }
   await send_anime_card(msg.chat.id, internal_id);
   bot.sendMessage(msg.chat.id, `✅ Anime qo‘shildi!\n\nInternal ID: ${internal_id}\nCustom ID: ${data.custom_id}`);
 }
@@ -976,29 +970,90 @@ bot.on('channel_post', async (msg) => {
   }
 });
 
-// Region survey enable/disable
-bot.onText(/\/enable_region_survey/, async (msg) => {
+// Add partner (only admin)
+bot.onText(/\/addpartner/, (msg) => {
   if (!is_admin(msg.from.id)) return;
-  await settings.updateOne({ key: "region_survey_enabled" }, { $set: { value: true } }, { upsert: true });
-  let sent = 0;
-  const cursor = users.find({ region: { $exists: false } });
-  for await (const u of cursor) {
-    try {
-      await send_region_survey(u.user_id);
-      sent++;
-    } catch {}
-  }
-  bot.sendMessage(msg.chat.id, `✅ Viloyat so'rovnomasi yoqildi va ${sent} ta foydalanuvchiga yuborildi`);
+  bot.sendMessage(msg.chat.id, "Hamkor qo'shiladigan user ID:").then(() => {
+    bot.once('message', async (response) => {
+      const uid = parseInt(response.text.trim());
+      if (isNaN(uid)) {
+        bot.sendMessage(response.chat.id, "❌ User ID raqam bo'lishi kerak");
+        return;
+      }
+      if (await is_partner(uid)) {
+        bot.sendMessage(response.chat.id, "❌ Bu user allaqachon hamkor");
+        return;
+      }
+      await partners.insertOne({ user_id: uid, added_animes: [], partner_channel: null });
+      bot.sendMessage(response.chat.id, `✅ ${uid} hamkor qo'shildi`);
+    });
+  });
 });
 
-bot.onText(/\/disable_region_survey/, async (msg) => {
+// Remove partner (only admin)
+bot.onText(/\/removepartner/, (msg) => {
   if (!is_admin(msg.from.id)) return;
-  await settings.updateOne({ key: "region_survey_enabled" }, { $set: { value: false } }, { upsert: true });
-  bot.sendMessage(msg.chat.id, `✅ Viloyat so'rovnomasi o'chirildi`);
+  bot.sendMessage(msg.chat.id, "Hamkor chiqariladigan user ID:").then(() => {
+    bot.once('message', async (response) => {
+      const uid = parseInt(response.text.trim());
+      if (isNaN(uid)) {
+        bot.sendMessage(response.chat.id, "❌ User ID raqam bo'lishi kerak");
+        return;
+      }
+      const partner = await partners.findOne({ user_id: uid });
+      if (!partner) {
+        bot.sendMessage(response.chat.id, "❌ Hamkor topilmadi");
+        return;
+      }
+      await partners.deleteOne({ user_id: uid });
+      bot.sendMessage(response.chat.id, `✅ ${uid} hamkorlikdan chiqarildi. Animelar qoladi, kanal o'chirildi`);
+    });
+  });
+});
+
+// Set partner channel
+bot.onText(/\/setchannel/, (msg) => {
+  const uid = msg.from.id;
+  if (!is_partner(uid)) return;
+  bot.sendMessage(msg.chat.id, "Majburiy kanal username (1 ta):").then(() => {
+    bot.once('message', async (res) => {
+      const ch = res.text.trim().replace(/^@/, '');
+      await partners.updateOne({ user_id: uid }, { $set: { partner_channel: ch } });
+      bot.sendMessage(res.chat.id, `✅ @${ch} majburiy kanal o'rnatildi`);
+    });
+  });
+});
+
+// Remove partner channel
+bot.onText(/\/removechannel/, async (msg) => {
+  const uid = msg.from.id;
+  if (!is_partner(uid)) return;
+  await partners.updateOne({ user_id: uid }, { $set: { partner_channel: null } });
+  bot.sendMessage(msg.chat.id, "✅ Majburiy kanal o'chirildi");
+});
+
+// Partner stats
+bot.onText(/\/mystats/, async (msg) => {
+  const uid = msg.from.id;
+  if (!is_partner(uid)) return;
+  const partner = await partners.findOne({ user_id: uid });
+  if (!partner.added_animes.length) {
+    bot.sendMessage(msg.chat.id, "Siz hali anime qo'shmagansiz");
+    return;
+  }
+  const animes = await serials.find({ _id: { $in: partner.added_animes } }).toArray();
+  let text = "<b>Sizning statistikangiz:</b>\n\n";
+  let total_views = 0;
+  for (let anime of animes) {
+    text += `${anime.title} — ${anime.views || 0} ko'rish\n`;
+    total_views += anime.views || 0;
+  }
+  text += `\nJami ko'rishlar: ${total_views}`;
+  bot.sendMessage(msg.chat.id, text, { parse_mode: "HTML" });
 });
 
 // ======================
-// Botni ishga tushirish
+// Botni ishga tushiramiz
 // ======================
 startBot();
 
@@ -1007,6 +1062,4 @@ const app = express();
 app.get("/", (req, res) => {
   res.status(200).send("Anime Bot ishlayapti ✨");
 });
-app.listen(5000, () => {
-  console.log("Express server 5000-portda ishlamoqda");
-});
+app.listen(5000);
